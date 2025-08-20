@@ -3,3 +3,4 @@ uvicorn
 pymongo
 python-dotenv
 yt-dlp
+python-telegram-bot==20.3
