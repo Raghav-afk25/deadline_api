@@ -1,38 +1,22 @@
-import time
-from collections import defaultdict
-from app.config import API_KEYS
+from fastapi import HTTPException
+from datetime import datetime
+from app.config import users_col
 
-class RateLimiter:
-    def __init__(self):
-        self.daily_count = defaultdict(int)
-        self.monthly_count = defaultdict(int)
-        self.last_reset_day = int(time.strftime("%j"))  # day of year
-        self.last_reset_month = int(time.strftime("%m"))
+def check_api_key(key: str):
+    user = users_col.find_one({"api_key": key})
+    if not user:
+        raise HTTPException(status_code=403, detail="Invalid API Key")
 
-    def reset_if_needed(self):
-        current_day = int(time.strftime("%j"))
-        current_month = int(time.strftime("%m"))
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    usage = user.get("usage", {})
+    today_usage = usage.get(today, 0)
 
-        if current_day != self.last_reset_day:
-            self.daily_count.clear()
-            self.last_reset_day = current_day
+    daily_limit = user.get("daily_limit", 1000)
 
-        if current_month != self.last_reset_month:
-            self.monthly_count.clear()
-            self.last_reset_month = current_month
+    if today_usage >= daily_limit:
+        raise HTTPException(status_code=429, detail="Daily limit reached")
 
-    def allow_request(self, key: str) -> bool:
-        self.reset_if_needed()
-        if key not in API_KEYS:
-            return False
-
-        daily_limit, monthly_limit = API_KEYS[key]
-
-        if self.daily_count[key] >= daily_limit:
-            return False
-        if self.monthly_count[key] >= monthly_limit:
-            return False
-
-        self.daily_count[key] += 1
-        self.monthly_count[key] += 1
-        return True
+    # update usage
+    usage[today] = today_usage + 1
+    users_col.update_one({"api_key": key}, {"$set": {"usage": usage}})
+    return user
