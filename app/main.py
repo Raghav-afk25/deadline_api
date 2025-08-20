@@ -1,32 +1,18 @@
-import os
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse
-from app.utils import RateLimiter
-from app.downloader import download_from_youtube
-from app.config import API_KEYS
+from app.utils import check_api_key
+from app.downloader import download_song
+from app.plans import PLANS
 
 app = FastAPI(title="DeadlineTech API")
-limiter = RateLimiter()
-
-@app.middleware("http")
-async def check_rate_limit(request: Request, call_next):
-    key = request.query_params.get("key")
-    if not key or key not in API_KEYS:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
-    if not limiter.allow_request(key):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded for your plan")
-
-    return await call_next(request)
-
-@app.get("/song/{video_id}")
-async def get_song(video_id: str, key: str = Query(...), video: bool = False):
-    try:
-        file_path = download_from_youtube(video_id, video=video)
-        return FileResponse(file_path, filename=os.path.basename(file_path))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
-async def root():
-    return {"status": "ok", "message": "Deadline API is running 🚀"}
+def root():
+    return {"status": "running", "plans": PLANS}
+
+@app.get("/song/{video_id}")
+def get_song(video_id: str, key: str = Query(...), video: bool = False):
+    user = check_api_key(key)
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    file_path = download_song(url, is_video=video)
+    return FileResponse(file_path, filename=file_path.split("/")[-1])
