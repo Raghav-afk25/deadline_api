@@ -1,27 +1,38 @@
 import time
-from fastapi import HTTPException
-from app.config import API_KEYS, PLANS
+from collections import defaultdict
+from app.config import API_KEYS
 
-# Store request timestamps
-request_logs = {}
+class RateLimiter:
+    def __init__(self):
+        self.daily_count = defaultdict(int)
+        self.monthly_count = defaultdict(int)
+        self.last_reset_day = int(time.strftime("%j"))  # day of year
+        self.last_reset_month = int(time.strftime("%m"))
 
-def check_rate_limit(api_key: str):
-    if api_key not in API_KEYS:
-        raise HTTPException(status_code=403, detail="Invalid API Key")
+    def reset_if_needed(self):
+        current_day = int(time.strftime("%j"))
+        current_month = int(time.strftime("%m"))
 
-    plan = API_KEYS[api_key]
-    limit = PLANS.get(plan, 5)  # default FREE
+        if current_day != self.last_reset_day:
+            self.daily_count.clear()
+            self.last_reset_day = current_day
 
-    now = time.time()
-    window = 60  # seconds
+        if current_month != self.last_reset_month:
+            self.monthly_count.clear()
+            self.last_reset_month = current_month
 
-    if api_key not in request_logs:
-        request_logs[api_key] = []
+    def allow_request(self, key: str) -> bool:
+        self.reset_if_needed()
+        if key not in API_KEYS:
+            return False
 
-    # Purge old requests
-    request_logs[api_key] = [t for t in request_logs[api_key] if now - t < window]
+        daily_limit, monthly_limit = API_KEYS[key]
 
-    if len(request_logs[api_key]) >= limit:
-        raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({plan} plan)")
+        if self.daily_count[key] >= daily_limit:
+            return False
+        if self.monthly_count[key] >= monthly_limit:
+            return False
 
-    request_logs[api_key].append(now)
+        self.daily_count[key] += 1
+        self.monthly_count[key] += 1
+        return True
