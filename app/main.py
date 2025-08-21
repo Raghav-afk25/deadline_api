@@ -7,19 +7,15 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.responses import FileResponse
-
-# Telegram (only used if BOT_TOKEN & CHANNEL_ID are set)
 from telegram import Bot
 
-# Config & helpers
 from app.config import (
-    API_KEY,
     BOT_TOKEN,
     CHANNEL_ID,
     DOWNLOAD_DIR,
-    users_col,   # <- Mongo collection: api_keys
+    users_col,   # Mongo collection: api_keys
 )
-from app.utils import get_media, save_media          # Mongo cache (url/type -> file_id)
+from app.utils import get_media, save_media
 from app.downloader import url_from_id, download_audio, download_video
 
 
@@ -38,21 +34,14 @@ def _month() -> str:
     now = datetime.utcnow()
     return f"{now.year:04d}-{now.month:02d}"
 
-# ------------------------- key + quota handling ----------------------------- #
+# ------------------------- per-user key handling ---------------------------- #
 
 def consume_request(key: str):
     """
-    Accepts either:
-      - Master API_KEY from config.py  (bypass limits)
-      - A per-user key stored by the bot in Mongo (collection: api_keys)
-    Enforces daily/monthly limits & expiry for per-user keys.
-    Returns (ok: bool, info: dict|str)
+    ONLY accept per-user keys issued by the bot (stored in Mongo: api_keys).
+    Enforce active/expiry + daily/monthly quotas.
+    Return (ok, info). On ok=False, info is an error code.
     """
-    # Master key bypass
-    if key and key == API_KEY:
-        return True, {"mode": "master"}
-
-    # Per-user key path
     user = users_col.find_one({"api_key": key})
     if not user:
         return False, "invalid_key"
@@ -64,7 +53,7 @@ def consume_request(key: str):
     if isinstance(exp, datetime) and exp < datetime.utcnow():
         return False, "expired"
 
-    # reset counters if day/month rolled over
+    # reset daily/monthly if rolled over
     today = _today()
     if user.get("daily_reset_date") != today:
         user["daily_reset_date"] = today
@@ -85,7 +74,7 @@ def consume_request(key: str):
     if monthly_count >= monthly_limit:
         return False, "monthly_quota_exceeded"
 
-    # increment usage
+    # increment usage and persist
     user["daily_count"] = daily_count + 1
     user["monthly_count"] = monthly_count + 1
     usage = user.get("usage", {})
@@ -101,11 +90,8 @@ def consume_request(key: str):
     }})
 
     return True, {
-        "mode": "user",
-        "user": {
-            "tg_id": user.get("tg_id"),
-            "plan": user.get("plan_code"),
-        }
+        "tg_id": user.get("tg_id"),
+        "plan": user.get("plan_code"),
     }
 
 # --------------------------- Telegram uploader ------------------------------ #
@@ -143,14 +129,14 @@ def root():
 def health():
     return {"ok": True}
 
-# Pattern: GET /song/{ytid}?key=<API_KEY>[&video=True]
+# Pattern: GET /song/{ytid}?key=<USER_API_KEY>[&video=True]
 @app.get("/song/{ytid}", tags=["media"])
 def song_endpoint(
     ytid: str = Path(..., description="YouTube video ID"),
-    key: str = Query(..., description="API key"),
+    key: str = Query(..., description="User API key from the bot (/getkey)"),
     video: bool = Query(False, description="Return video instead of audio"),
 ):
-    # 1) accept master or per-user key; enforce quotas for user keys
+    # 1) only user keys allowed
     ok, info = consume_request(key)
     if not ok:
         code = 429 if info in ("daily_quota_exceeded", "monthly_quota_exceeded") else 403
@@ -189,9 +175,7 @@ def song_endpoint(
         file_id = None
 
     if file_id:
-        # save to cache for instant next time
         save_media(url, media_type, title, file_id)
-        # delete local file
         try:
             os.remove(file_path)
         except Exception:
