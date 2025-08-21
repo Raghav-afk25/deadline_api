@@ -1,87 +1,160 @@
+# app/main.py
+from __future__ import annotations
+
 import os
-from fastapi import FastAPI, HTTPException, Query, Path
-from fastapi.responses import FileResponse
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Path, Query
+from fastapi.responses import FileResponse, JSONResponse
+
+# Telegram (blocking API; we'll run it in a thread when needed)
 from telegram import Bot
 
-from app.config import BOT_TOKEN, CHANNEL_ID
-from app.utils import get_media, save_media
-from app.downloader import download_song   # ✅ only this now
-from app.auth import check_api_key         # ✅ quota check yahi hai
+# Our modules
+from app.config import (
+    API_KEY,
+    BOT_TOKEN,
+    CHANNEL_ID,
+    DOWNLOAD_DIR,
+)
+from app.utils import get_media, save_media  # Mongo cache helpers
+from app.downloader import url_from_id, download_audio, download_video
 
-app = FastAPI(title="DeadlineTech API")
 
-@app.get("/")
-async def root():
-    return {"ok": True, "msg": "DeadlineTech API running"}
+app = FastAPI(
+    title="DeadlineTech API",
+    version="1.0.0",
+    description="Ultra-fast YouTube audio/video fetch API for Telegram music bots.",
+)
 
-# Pattern: GET /song/{ytid}?key=<API_KEY>[&video=True]
-@app.get("/song/{ytid}")
-async def song_endpoint(
+
+# ----------------------------- helpers --------------------------------- #
+
+def _check_api_key(key: str) -> None:
+    """
+    Simple API key check:
+    - Allows the single global API_KEY from .env
+    (If you later use per-user keys via Mongo, you can replace this.)
+    """
+    if not key or key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+
+def _upload_to_channel(file_path: str, title: str, media_type: str) -> Optional[str]:
+    """
+    Uploads the media to Telegram channel if BOT_TOKEN and CHANNEL_ID are set.
+    Returns the Telegram file_id if uploaded, else None.
+    """
+    if not BOT_TOKEN or not CHANNEL_ID:
+        return None
+
+    bot = Bot(token=BOT_TOKEN)
+
+    if media_type == "audio":
+        with open(file_path, "rb") as f:
+            sent = bot.send_audio(chat_id=CHANNEL_ID, audio=f, title=title)
+            return sent.audio.file_id if sent and sent.audio else None
+    else:
+        with open(file_path, "rb") as f:
+            sent = bot.send_video(
+                chat_id=CHANNEL_ID,
+                video=f,
+                caption=title,
+                supports_streaming=True,
+            )
+            return sent.video.file_id if sent and sent.video else None
+
+
+# ------------------------------ routes ---------------------------------- #
+
+@app.get("/", tags=["meta"])
+def root():
+    return {"ok": True, "service": "DeadlineTech API"}
+
+
+@app.get("/health", tags=["meta"])
+def health():
+    return {"ok": True}
+
+
+@app.get("/song/{ytid}", tags=["media"])
+def song_endpoint(
     ytid: str = Path(..., description="YouTube video ID"),
     key: str = Query(..., description="API key"),
     video: bool = Query(False, description="Return video instead of audio"),
 ):
-    # 1) Enforce API key quotas (Mongo)
-    user = check_api_key(key)   # ✅ yeh tumhara auth.py wala function use karega
+    """
+    Pattern:
+      GET /song/{ytid}?key=<API_KEY>[&video=True]
+    - Checks API key
+    - Looks up cache (Mongo) → returns Telegram file_id if found
+    - Downloads via yt-dlp (audio MP3 192kbps, or video 720p MP4)
+    - If Telegram configured → uploads to channel, caches file_id, returns JSON
+      Otherwise → serves the file directly as a download
+    """
+    _check_api_key(key)
 
-    url = f"https://www.youtube.com/watch?v={ytid}"
     media_type = "video" if video else "audio"
+    url = url_from_id(ytid)
 
-    # 2) Cache check (Mongo -> Telegram file_id)
+    # 1) cache check
     cached = get_media(url, media_type)
     if cached:
         return {
             "ok": True,
             "cached": True,
             "type": media_type,
-            "title": cached.get("title", ""),
+            "title": cached.get("title") or "",
             "url": url,
-            "file_id": cached["file_id"],
+            "file_id": cached.get("file_id"),
         }
 
-    # 3) Download now (Audio: HQ MP3, Video: 720p MP4)
+    # 2) download now
     try:
-        file_path = download_song(url, is_video=video)
-        title = os.path.basename(file_path).rsplit(".", 1)[0]
-    except Exception as e:
-        raise HTTPException(500, f"download_failed: {e}")
-
-    # 4) If Telegram is configured → upload to channel & cache; else return file directly
-    if not BOT_TOKEN or not CHANNEL_ID:
-        # Fallback: serve file over HTTP (no channel caching)
-        return FileResponse(file_path, filename=os.path.basename(file_path))
-
-    bot = Bot(token=BOT_TOKEN)
-    try:
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         if media_type == "audio":
-            sent = await bot.send_audio(
-                chat_id=CHANNEL_ID,
-                audio=open(file_path, "rb"),
-                title=title,
-            )
-            file_id = sent.audio.file_id
+            file_path, title = download_audio(url)
         else:
-            sent = await bot.send_video(
-                chat_id=CHANNEL_ID,
-                video=open(file_path, "rb"),
-                caption=title,
-                supports_streaming=True,
-            )
-            file_id = sent.video.file_id
-    finally:
-        # Always clean local file
+            file_path, title = download_video(url)
+    except Exception as e:
+        # yt-dlp errors are long; pass a readable message
+        raise HTTPException(
+            status_code=500,
+            detail=f"Download error: {e}"
+        )
+
+    # 3) if telegram configured, upload & cache; else serve file directly
+    file_id = None
+    try:
+        file_id = _upload_to_channel(file_path, title, media_type)
+    except Exception as e:
+        # Don't fail the whole request if Telegram upload fails; just continue
+        # and return the file directly.
+        file_id = None
+
+    # Clean up local file after we either uploaded or will serve it
+    if file_id:
+        # save to cache for future instant response
+        save_media(url, media_type, title, file_id)
+        # remove local file
         try:
             os.remove(file_path)
         except Exception:
             pass
 
-    # 5) Save to Mongo cache and respond
-    save_media(url, media_type, title, file_id)
-    return {
-        "ok": True,
-        "cached": False,
-        "type": media_type,
-        "title": title,
-        "url": url,
-        "file_id": file_id,
-    }
+        return {
+            "ok": True,
+            "cached": False,
+            "type": media_type,
+            "title": title,
+            "url": url,
+            "file_id": file_id,
+        }
+
+    # Fallback: return the actual file over HTTP if telegram is not configured
+    filename = os.path.basename(file_path)
+    return FileResponse(
+        path=file_path,
+        filename=filename,
+        media_type="application/octet-stream",
+    )
