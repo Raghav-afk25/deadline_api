@@ -1,6 +1,16 @@
+import os
 import yt_dlp
 
+# Ensure downloads folder exists
+os.makedirs("downloads", exist_ok=True)
+
 def download_song(url: str, is_video: bool = False):
+    """
+    Download song or video from YouTube
+    :param url: YouTube video URL
+    :param is_video: True -> video 720p, False -> mp3 audio
+    :return: dict with filename, title, duration
+    """
     ydl_opts = {
         "outtmpl": "downloads/%(title)s.%(ext)s",
         "cookiefile": "cookies/cookies.txt",
@@ -24,4 +34,10 @@ def download_song(url: str, is_video: bool = False):
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info)
+        filename = ydl.prepare_filename(info)
+
+        return {
+            "filename": filename,
+            "title": info.get("title"),
+            "duration": info.get("duration"),
+        }
