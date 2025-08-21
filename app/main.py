@@ -4,7 +4,7 @@ from fastapi.responses import FileResponse
 from telegram import Bot
 
 from app.config import BOT_TOKEN, CHANNEL_ID
-from app.utils import consume_request, get_media, save_media
+from app.utils import get_media, save_media
 from app.downloader import url_from_id, download_audio, download_video
 
 app = FastAPI(title="DeadlineTech API")
