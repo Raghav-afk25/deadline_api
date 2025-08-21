@@ -13,6 +13,7 @@ OWNER_ID    = 8162844043
 
 COOKIES_PATH = "cookies/cookies.txt"
 DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ── Proxy settings ────────────────────────────────────────────────────────────
 PROXY_HOST = "p.webshare.io"
@@ -29,7 +30,7 @@ os.environ.setdefault("HTTPS_PROXY", PROXY_URL)
 # ── Mongo setup ───────────────────────────────────────────────────────────────
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client[DB_NAME]
-users_col = db["users"]
+users_col = db["api_keys"]   # <-- IMPORTANT: bot & API use same collection
 cache_col = db["cache"]
 
 # ── Plans (daily / monthly limits) ────────────────────────────────────────────
