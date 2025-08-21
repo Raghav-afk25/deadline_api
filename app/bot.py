@@ -1,104 +1,111 @@
 # app/bot.py
 import os
+import logging
 import secrets
 from datetime import datetime, timedelta
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from app.config import BOT_TOKEN, users_col, PLANS  # PLANS if you keep plans in config
-# If you keep PLANS in app/plans.py then: from app.plans import PLANS
+from app.config import BOT_TOKEN, users_col, PLANS  # ensure these exist in config.py
 
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # your Telegram user id
+# ------------ Logging ------------
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO
+)
+log = logging.getLogger("deadline-bot")
 
-def _month_str():
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # your personal Telegram user id
+
+# ------------ helpers ------------
+def _today() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def _month() -> str:
     now = datetime.utcnow()
     return f"{now.year:04d}-{now.month:02d}"
 
-def _today_str():
-    return datetime.utcnow().strftime("%Y-%m-%d")
-
 def _new_key() -> str:
-    # short, URL-safe key
     return secrets.token_urlsafe(16)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _owner(update: Update) -> bool:
+    return update.effective_user and update.effective_user.id == OWNER_ID
+
+# ------------ commands ------------
+async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "DeadlineTech Bot\n\n"
+        "DeadlineTech Bot online ✅\n\n"
         "Commands:\n"
-        "/getkey - Generate/Rotate your API key\n"
-        "/myplan - Show your plan & usage\n"
-        "/plans  - View available plans (codes)\n"
-        "Owner-only: /setplan <user_id> <plan_code> [months]\n"
-        "            /ban <user_id> | /unban <user_id>\n"
+        "/ping – check bot is alive\n"
+        "/id – show your user id\n"
+        "/plans – list plans\n"
+        "/getkey – generate/rotate your API key\n"
+        "/myplan – show current plan & usage\n"
+        "\nOwner only:\n"
+        "/setplan <tg_user_id> <plan_code> [months]\n"
+        "/ban <tg_user_id>\n/unban <tg_user_id>\n"
     )
 
-async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = []
-    for code, p in PLANS.items():
-        lines.append(f"{code}: {p['daily']}/day, {p['monthly']}/month, ₹{p.get('price_rs', '-')}rs")
+async def ping(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong ✅")
+
+async def my_id(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Your user id: `{update.effective_user.id}`", parse_mode="Markdown")
+
+async def plans(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    lines = [f"{k}: {v['daily']}/day, {v['monthly']}/month, ₹{v.get('price_rs','-')}" for k, v in PLANS.items()]
     await update.message.reply_text("Available plans:\n" + "\n".join(lines))
 
-async def getkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def getkey(update: Update, _: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = users_col.find_one({"tg_id": uid})
     if not user:
-        # default plan when first time (you can change)
-        default = "d1k" if "d1k" in PLANS else list(PLANS.keys())[0]
-        plan = PLANS[default]
+        plan_code = "d1k" if "d1k" in PLANS else list(PLANS.keys())[0]
+        plan = PLANS[plan_code]
         key = _new_key()
         now = datetime.utcnow()
-        doc = {
+        users_col.insert_one({
             "tg_id": uid,
             "api_key": key,
-            "plan_code": default,
+            "plan_code": plan_code,
             "daily_limit": plan["daily"],
             "monthly_limit": plan["monthly"],
             "active": True,
             "created_at": now,
-            "expires_at": now + timedelta(days=30),  # 1 month
-            "daily_count": 0,
-            "daily_reset_date": _today_str(),
-            "monthly_count": 0,
-            "month_start": _month_str(),
-            # optional usage maps if you use them elsewhere
-            "usage": {},
-            "monthly_usage": {},
-        }
-        users_col.insert_one(doc)
+            "expires_at": now + timedelta(days=30),
+            "daily_count": 0, "daily_reset_date": _today(),
+            "monthly_count": 0, "month_start": _month(),
+            "usage": {}, "monthly_usage": {},
+        })
         await update.message.reply_text(
-            f"Your API key:\n`{key}`\n\nPlan: {default}\nDaily: {plan['daily']} | Monthly: {plan['monthly']}",
-            parse_mode="Markdown",
+            f"Your API key:\n`{key}`\nPlan: {plan_code}\nDaily: {plan['daily']} | Monthly: {plan['monthly']}",
+            parse_mode="Markdown"
         )
     else:
-        # rotate (new key) keeping plan/limits same
         key = _new_key()
         users_col.update_one({"tg_id": uid}, {"$set": {"api_key": key}})
-        await update.message.reply_text(f"Your new API key:\n`{key}`", parse_mode="Markdown")
+        await update.message.reply_text(f"New API key:\n`{key}`", parse_mode="Markdown")
 
-async def myplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def myplan(update: Update, _: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     user = users_col.find_one({"tg_id": uid})
     if not user:
         await update.message.reply_text("No key yet. Use /getkey")
         return
-    dleft = max(0, int(user.get("daily_limit", 0)) - int(user.get("daily_count", 0)))
-    mleft = max(0, int(user.get("monthly_limit", 0)) - int(user.get("monthly_count", 0)))
+    d = user.get("daily_count", 0); dl = user.get("daily_limit", 0)
+    m = user.get("monthly_count", 0); ml = user.get("monthly_limit", 0)
     msg = (
         f"Plan: {user.get('plan_code')}\n"
-        f"API Key: `{user.get('api_key')}`\n"
-        f"Daily: {user.get('daily_count',0)}/{user.get('daily_limit')}, left {dleft}\n"
-        f"Monthly: {user.get('monthly_count',0)}/{user.get('monthly_limit')}, left {mleft}\n"
+        f"Key: `{user.get('api_key')}`\n"
+        f"Daily: {d}/{dl} | Monthly: {m}/{ml}\n"
         f"Active: {user.get('active', True)}\n"
         f"Expires: {user.get('expires_at')}"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-def _owner_check(update: Update) -> bool:
-    return update.effective_user and update.effective_user.id == OWNER_ID
-
 async def setplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _owner_check(update):
+    if not _owner(update):
         await update.message.reply_text("Owner only.")
         return
     if len(context.args) < 2:
@@ -106,7 +113,7 @@ async def setplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         target = int(context.args[0])
-    except:
+    except Exception:
         await update.message.reply_text("Invalid tg_user_id")
         return
     plan_code = context.args[1]
@@ -116,22 +123,21 @@ async def setplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     plan = PLANS[plan_code]
     now = datetime.utcnow()
-    res = users_col.find_one_and_update(
+    users_col.update_one(
         {"tg_id": target},
         {"$set": {
             "plan_code": plan_code,
             "daily_limit": plan["daily"],
             "monthly_limit": plan["monthly"],
             "expires_at": now + timedelta(days=30*months),
-            "active": True,
+            "active": True
         }},
-        upsert=True,
-        return_document=True,
+        upsert=True
     )
     await update.message.reply_text(f"Set plan for {target}: {plan_code} ({plan['daily']}/day, {plan['monthly']}/month)")
 
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _owner_check(update):
+    if not _owner(update):
         await update.message.reply_text("Owner only.")
         return
     if not context.args:
@@ -141,7 +147,7 @@ async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Banned.")
 
 async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _owner_check(update):
+    if not _owner(update):
         await update.message.reply_text("Owner only.")
         return
     if not context.args:
@@ -150,12 +156,18 @@ async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users_col.update_one({"tg_id": int(context.args[0])}, {"$set": {"active": True}})
     await update.message.reply_text("Unbanned.")
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("Update caused error: %s", context.error)
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN missing in .env")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("id", my_id))
     app.add_handler(CommandHandler("plans", plans))
     app.add_handler(CommandHandler("getkey", getkey))
     app.add_handler(CommandHandler("myplan", myplan))
@@ -163,7 +175,14 @@ def main():
     app.add_handler(CommandHandler("ban", ban))
     app.add_handler(CommandHandler("unban", unban))
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_error_handler(on_error)
+
+    # very important if old webhook was set
+    # (telegram lib handles automatically, but do it once manually too)
+    # import asyncio; asyncio.run(app.bot.delete_webhook())
+
+    log.info("Starting bot polling…")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
