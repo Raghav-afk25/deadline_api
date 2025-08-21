@@ -5,7 +5,8 @@ from telegram import Bot
 
 from app.config import BOT_TOKEN, CHANNEL_ID
 from app.utils import get_media, save_media
-from app.downloader import url_from_id, download_audio, download_video
+from app.downloader import download_song   # ✅ only this now
+from app.auth import check_api_key         # ✅ quota check yahi hai
 
 app = FastAPI(title="DeadlineTech API")
 
@@ -21,12 +22,9 @@ async def song_endpoint(
     video: bool = Query(False, description="Return video instead of audio"),
 ):
     # 1) Enforce API key quotas (Mongo)
-    ok, info = consume_request(key)
-    if not ok:
-        code = 429 if info in ("daily_quota_exceeded", "monthly_quota_exceeded") else 403
-        raise HTTPException(code, detail=str(info))
+    user = check_api_key(key)   # ✅ yeh tumhara auth.py wala function use karega
 
-    url = url_from_id(ytid)
+    url = f"https://www.youtube.com/watch?v={ytid}"
     media_type = "video" if video else "audio"
 
     # 2) Cache check (Mongo -> Telegram file_id)
@@ -43,30 +41,28 @@ async def song_endpoint(
 
     # 3) Download now (Audio: HQ MP3, Video: 720p MP4)
     try:
-        if media_type == "audio":
-            file_path, title = download_audio(url)
-        else:
-            file_path, title = download_video(url)
+        file_path = download_song(url, is_video=video)
+        title = os.path.basename(file_path).rsplit(".", 1)[0]
     except Exception as e:
         raise HTTPException(500, f"download_failed: {e}")
 
     # 4) If Telegram is configured → upload to channel & cache; else return file directly
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+    if not BOT_TOKEN or not CHANNEL_ID:
         # Fallback: serve file over HTTP (no channel caching)
         return FileResponse(file_path, filename=os.path.basename(file_path))
 
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    bot = Bot(token=BOT_TOKEN)
     try:
         if media_type == "audio":
             sent = await bot.send_audio(
-                chat_id=TELEGRAM_CHANNEL_ID,
+                chat_id=CHANNEL_ID,
                 audio=open(file_path, "rb"),
                 title=title,
             )
             file_id = sent.audio.file_id
         else:
             sent = await bot.send_video(
-                chat_id=TELEGRAM_CHANNEL_ID,
+                chat_id=CHANNEL_ID,
                 video=open(file_path, "rb"),
                 caption=title,
                 supports_streaming=True,
