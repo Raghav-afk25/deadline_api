@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException, Query, Path
 from fastapi.responses import FileResponse
 from telegram import Bot
 
-from app.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID
+from app.config import BOT_TOKEN, CHANNEL_ID
 from app.utils import consume_request, get_media, save_media
 from app.downloader import url_from_id, download_audio, download_video
 
