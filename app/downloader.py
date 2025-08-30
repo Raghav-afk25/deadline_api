@@ -1,112 +1,111 @@
-import os
-import requests
-import yt_dlp
+import os, shutil, requests
 from pathlib import Path
+from typing import Tuple
+import yt_dlp
 
-# ---------- Paths ----------
+# Paths
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DOWNLOAD_DIR = ROOT_DIR / "downloads"
 COOKIES_PATH = ROOT_DIR / "cookies" / "cookies.txt"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------- Your fast external API ----------
-EXTERNAL_BASE = "https://tgmusic.fallenapi.fun"
-EXTERNAL_KEY  = "3882f1_aEYwyGw56gqPKEMfJZoOculHd3GivN8p"
+# External API config
+EXT_API_URL = "https://tgmusic.fallenapi.fun"
+EXT_API_KEY = "3882f1_aEYwyGw56gqPKEMfJZoOculHd3GivN8p"
 
-ANDROID_UA = "com.google.android.youtube/19.20.35 (Linux; Android 13)"
-IOS_UA     = "com.google.ios.youtube/19.20.37 (iPhone15,3; iOS 17_5)"
+# User-Agents
+UA_ANDROID = "com.google.android.youtube/19.20.35 (Linux; Android 13)"
+UA_IOS     = "com.google.ios.youtube/19.20.37 (iPhone15,3; iOS 17_5)"
 
-def url_from_id(ytid: str) -> str:
+def _yt_url(ytid: str) -> str:
     return f"https://www.youtube.com/watch?v={ytid}"
 
-# ---------- External API (primary) ----------
-def get_from_external_api(ytid: str, video: bool = False):
-    """
-    Try to fetch from your super-fast API.
-    - Audio:  .../song/{id}?key=KEY
-    - Video:  .../song/{id}?key=KEY&video=True
-    Saves to downloads and returns (filepath, title-like).
-    Returns None on any error so caller can fallback to yt-dlp.
-    """
-    try:
-        params = {"key": EXTERNAL_KEY}
-        if video:
-            params["video"] = "True"
-        url = f"{EXTERNAL_BASE}/song/{ytid}"
-
-        # stream to disk (fast & memory-safe)
-        with requests.get(url, params=params, timeout=25, stream=True) as r:
-            if r.status_code != 200:
-                return None
-            ext = ".mp4" if video else ".m4a"
-            fpath = DOWNLOAD_DIR / f"{ytid}{ext}"
-            with open(fpath, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 512):  # 512 KiB
-                    if chunk:
-                        f.write(chunk)
-            # very quick title – you can enhance later
-            return str(fpath), f"extapi_{ytid}"
-    except Exception as e:
-        print(f"[external api fail] {e}")
-        return None
-
-# ---------- yt-dlp fallback (cookies) ----------
-def _base_opts():
-    return {
-        "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
-        "quiet": True,
+def _base_opts() -> dict:
+    opts = {
         "noplaylist": True,
+        "quiet": True,
         "cookiefile": str(COOKIES_PATH),
-        "merge_output_format": "mp4",
-        # speed/robustness
-        "concurrent_fragment_downloads": 10,
-        "fragment_retries": 20,
-        "retries": 20,
+        "retries": 30,
+        "fragment_retries": 30,
+        "concurrent_fragment_downloads": 16,
         "nocheckcertificate": True,
-        "source_address": "0.0.0.0",
-        "http_headers": {"User-Agent": ANDROID_UA},
+        "extractor_args": {"youtube": {"player_client": ["android"]}},
+        "http_headers": {"User-Agent": UA_ANDROID},
     }
+    if shutil.which("aria2c"):
+        opts["external_downloader"] = "aria2c"
+        opts["external_downloader_args"] = [
+            "--max-connection-per-server=16",
+            "--split=16",
+            "--min-split-size=1M",
+            "--allow-overwrite=true",
+            "--auto-file-renaming=false",
+            "--summary-interval=0",
+        ]
+    return opts
 
-def download_audio(yt_url: str, ytid: str):
-    """
-    Prefer native m4a (no convert). Falls back to bestaudio.
-    Saves as {ytid}.m4a
-    """
-    fpath = DOWNLOAD_DIR / f"{ytid}.m4a"
-    if fpath.exists():
-        return str(fpath), ytid
+# -------- Try External API first --------------------------------------
+def try_external_api(ytid: str, video: bool) -> str | None:
+    try:
+        url = f"{EXT_API_URL}/song/{ytid}"
+        r = requests.get(url, params={"key": EXT_API_KEY, "video": str(video).lower()}, timeout=15)
+        if r.status_code == 200:
+            out = DOWNLOAD_DIR / f"{ytid}{'.mp4' if video else '.m4a'}"
+            with open(out, "wb") as f:
+                f.write(r.content)
+            return str(out)
+    except Exception as e:
+        print("External API failed:", e)
+    return None
 
+# -------- Audio -------------------------------------------------------
+def download_audio_by_id(ytid: str) -> Tuple[str, str]:
+    out = DOWNLOAD_DIR / f"{ytid}.m4a"
+    if out.exists():
+        return str(out), ytid
+
+    # 1) External API
+    fast = try_external_api(ytid, video=False)
+    if fast:
+        return fast, ytid
+
+    # 2) Fallback cookies yt-dlp
     opts = _base_opts()
     opts.update({
+        "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
         "format": "bestaudio[ext=m4a]/bestaudio/best",
-        # if bestaudio isn’t m4a, convert to m4a to keep consistent
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "m4a",
             "preferredquality": "192",
         }],
     })
-
+    url = _yt_url(ytid)
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.extract_info(yt_url, download=True)
+        info = ydl.extract_info(url, download=True)
+    return str(out), (info.get("title") or ytid)
 
-    return str(fpath), ytid
+# -------- Video -------------------------------------------------------
+def download_video_by_id(ytid: str) -> Tuple[str, str]:
+    out = DOWNLOAD_DIR / f"{ytid}.mp4"
+    if out.exists():
+        return str(out), ytid
 
-def download_video(yt_url: str, ytid: str):
-    """
-    720p AVC video + audio, final mp4
-    """
-    fpath = DOWNLOAD_DIR / f"{ytid}.mp4"
-    if fpath.exists():
-        return str(fpath), ytid
+    # 1) External API
+    fast = try_external_api(ytid, video=True)
+    if fast:
+        return fast, ytid
 
+    # 2) Fallback cookies yt-dlp
     opts = _base_opts()
+    opts["http_headers"] = {"User-Agent": UA_IOS}
+    opts["extractor_args"] = {"youtube": {"player_client": ["ios"]}}
     opts.update({
-        "http_headers": {"User-Agent": IOS_UA},
+        "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
+        "merge_output_format": "mp4",
         "format": "bv*[vcodec^=avc1][height<=720]+ba/b[height<=720]",
     })
-
+    url = _yt_url(ytid)
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.extract_info(yt_url, download=True)
-
-    return str(fpath), ytid
+        info = ydl.extract_info(url, download=True)
+    return str(out), (info.get("title") or ytid)
