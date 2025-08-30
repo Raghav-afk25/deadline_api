@@ -1,4 +1,4 @@
-import os, yt_dlp
+import os, yt_dlp, threading
 
 ANDROID_UA = "com.google.android.youtube/19.20.35 (Linux; Android 13)"
 IOS_UA     = "com.google.ios.youtube/19.20.37 (iPhone15,3; iOS 17_5)"
@@ -15,41 +15,63 @@ def url_from_id(ytid):
 
 def _base_opts():
     return {
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title).200B.%(ext)s"),
+        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
         "quiet": True,
         "noplaylist": True,
         "proxy": PROXY_URL,
         "cookiefile": COOKIES_PATH,
         "merge_output_format": "mp4",
+        "concurrent_fragment_downloads": 5,
+        "fragment_retries": 10,
+        "retries": 10,
+        "source_address": "0.0.0.0",
+        "prefer_insecure": True,
     }
 
-def download_audio(url):
+# ---- Direct URL (for instant playback) ---- #
+def get_direct_url(url, audio=True):
     opts = _base_opts()
-    opts.update({
-        "format": "bestaudio/best",
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192"
-        }],
-        "http_headers": {"User-Agent": ANDROID_UA}
-    })
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        out = ydl.prepare_filename(info).replace(".webm",".mp3")
-        return out, info.get("title")
+    opts.pop("outtmpl")  # not saving
+    if audio:
+        opts["format"] = "bestaudio/best"
+        opts["http_headers"] = {"User-Agent": ANDROID_UA}
+    else:
+        opts["format"] = "bv*[height<=720][vcodec^=avc1]+ba/b[height<=720]"
+        opts["http_headers"] = {"User-Agent": IOS_UA}
 
-def download_video(url):
-    opts = _base_opts()
-    opts.update({
-        "format": "bv*[height<=720][vcodec^=avc1]+ba/b[height<=720]",
-        "http_headers": {"User-Agent": IOS_UA}
-    })
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        out = ydl.prepare_filename(info)
-        if not out.endswith(".mp4"):
-            new = os.path.splitext(out)[0] + ".mp4"
-            os.rename(out,new)
-            out = new
-        return out, info.get("title")
+        info = ydl.extract_info(url, download=False)
+        return info["url"], info.get("title") or "media"
+
+# ---- Background download (for cache) ---- #
+def _bg_download(url, ytid, audio=True):
+    try:
+        fpath = os.path.join(DOWNLOAD_DIR, f"{ytid}.{'mp3' if audio else 'mp4'}")
+        if os.path.exists(fpath): return  # already cached
+        opts = _base_opts()
+        if audio:
+            opts.update({
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192"
+                }],
+                "outtmpl": fpath,
+                "http_headers": {"User-Agent": ANDROID_UA},
+            })
+        else:
+            opts.update({
+                "format": "bv*[height<=720][vcodec^=avc1]+ba/b[height<=720]",
+                "outtmpl": fpath,
+                "http_headers": {"User-Agent": IOS_UA},
+            })
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)
+    except Exception as e:
+        print(f"[bg_download error] {e}")
+
+def trigger_background_download(url, ytid, audio=True):
+    t = threading.Thread(target=_bg_download, args=(url, ytid, audio))
+    t.daemon = True
+    t.start()
