@@ -1,77 +1,112 @@
-import os, yt_dlp, threading
+import os
+import requests
+import yt_dlp
+from pathlib import Path
+
+# ---------- Paths ----------
+ROOT_DIR = Path(__file__).resolve().parent.parent
+DOWNLOAD_DIR = ROOT_DIR / "downloads"
+COOKIES_PATH = ROOT_DIR / "cookies" / "cookies.txt"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------- Your fast external API ----------
+EXTERNAL_BASE = "https://tgmusic.fallenapi.fun"
+EXTERNAL_KEY  = "3882f1_aEYwyGw56gqPKEMfJZoOculHd3GivN8p"
 
 ANDROID_UA = "com.google.android.youtube/19.20.35 (Linux; Android 13)"
 IOS_UA     = "com.google.ios.youtube/19.20.37 (iPhone15,3; iOS 17_5)"
 
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-COOKIES_PATH = os.path.join(ROOT_DIR, "cookies", "cookies.txt")
-DOWNLOAD_DIR = os.path.join(ROOT_DIR, "downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-PROXY_URL = "http://zclarjnk-rotate:83fjqnfinvpm@p.webshare.io:80"
-
-def url_from_id(ytid): 
+def url_from_id(ytid: str) -> str:
     return f"https://www.youtube.com/watch?v={ytid}"
 
+# ---------- External API (primary) ----------
+def get_from_external_api(ytid: str, video: bool = False):
+    """
+    Try to fetch from your super-fast API.
+    - Audio:  .../song/{id}?key=KEY
+    - Video:  .../song/{id}?key=KEY&video=True
+    Saves to downloads and returns (filepath, title-like).
+    Returns None on any error so caller can fallback to yt-dlp.
+    """
+    try:
+        params = {"key": EXTERNAL_KEY}
+        if video:
+            params["video"] = "True"
+        url = f"{EXTERNAL_BASE}/song/{ytid}"
+
+        # stream to disk (fast & memory-safe)
+        with requests.get(url, params=params, timeout=25, stream=True) as r:
+            if r.status_code != 200:
+                return None
+            ext = ".mp4" if video else ".m4a"
+            fpath = DOWNLOAD_DIR / f"{ytid}{ext}"
+            with open(fpath, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 512):  # 512 KiB
+                    if chunk:
+                        f.write(chunk)
+            # very quick title – you can enhance later
+            return str(fpath), f"extapi_{ytid}"
+    except Exception as e:
+        print(f"[external api fail] {e}")
+        return None
+
+# ---------- yt-dlp fallback (cookies) ----------
 def _base_opts():
     return {
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
+        "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
         "quiet": True,
         "noplaylist": True,
-        "proxy": PROXY_URL,
-        "cookiefile": COOKIES_PATH,
+        "cookiefile": str(COOKIES_PATH),
         "merge_output_format": "mp4",
-        "concurrent_fragment_downloads": 5,
-        "fragment_retries": 10,
-        "retries": 10,
+        # speed/robustness
+        "concurrent_fragment_downloads": 10,
+        "fragment_retries": 20,
+        "retries": 20,
+        "nocheckcertificate": True,
         "source_address": "0.0.0.0",
-        "prefer_insecure": True,
+        "http_headers": {"User-Agent": ANDROID_UA},
     }
 
-# ---- Direct URL (for instant playback) ---- #
-def get_direct_url(url, audio=True):
+def download_audio(yt_url: str, ytid: str):
+    """
+    Prefer native m4a (no convert). Falls back to bestaudio.
+    Saves as {ytid}.m4a
+    """
+    fpath = DOWNLOAD_DIR / f"{ytid}.m4a"
+    if fpath.exists():
+        return str(fpath), ytid
+
     opts = _base_opts()
-    opts.pop("outtmpl")  # not saving
-    if audio:
-        opts["format"] = "bestaudio/best"
-        opts["http_headers"] = {"User-Agent": ANDROID_UA}
-    else:
-        opts["format"] = "bv*[height<=720][vcodec^=avc1]+ba/b[height<=720]"
-        opts["http_headers"] = {"User-Agent": IOS_UA}
+    opts.update({
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        # if bestaudio isn’t m4a, convert to m4a to keep consistent
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "m4a",
+            "preferredquality": "192",
+        }],
+    })
 
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        return info["url"], info.get("title") or "media"
+        ydl.extract_info(yt_url, download=True)
 
-# ---- Background download (for cache) ---- #
-def _bg_download(url, ytid, audio=True):
-    try:
-        fpath = os.path.join(DOWNLOAD_DIR, f"{ytid}.{'mp3' if audio else 'mp4'}")
-        if os.path.exists(fpath): return  # already cached
-        opts = _base_opts()
-        if audio:
-            opts.update({
-                "format": "bestaudio/best",
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192"
-                }],
-                "outtmpl": fpath,
-                "http_headers": {"User-Agent": ANDROID_UA},
-            })
-        else:
-            opts.update({
-                "format": "bv*[height<=720][vcodec^=avc1]+ba/b[height<=720]",
-                "outtmpl": fpath,
-                "http_headers": {"User-Agent": IOS_UA},
-            })
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.extract_info(url, download=True)
-    except Exception as e:
-        print(f"[bg_download error] {e}")
+    return str(fpath), ytid
 
-def trigger_background_download(url, ytid, audio=True):
-    t = threading.Thread(target=_bg_download, args=(url, ytid, audio))
-    t.daemon = True
-    t.start()
+def download_video(yt_url: str, ytid: str):
+    """
+    720p AVC video + audio, final mp4
+    """
+    fpath = DOWNLOAD_DIR / f"{ytid}.mp4"
+    if fpath.exists():
+        return str(fpath), ytid
+
+    opts = _base_opts()
+    opts.update({
+        "http_headers": {"User-Agent": IOS_UA},
+        "format": "bv*[vcodec^=avc1][height<=720]+ba/b[height<=720]",
+    })
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.extract_info(yt_url, download=True)
+
+    return str(fpath), ytid
