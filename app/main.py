@@ -1,43 +1,47 @@
-import os
-from fastapi import FastAPI, Path, Query, HTTPException
+from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.responses import FileResponse
+import os
+
 from app.downloader import (
     url_from_id,
-    get_direct_url,
-    trigger_background_download,
+    get_from_external_api,
+    download_audio,
+    download_video,
+    DOWNLOAD_DIR,
 )
 
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DOWNLOAD_DIR = os.path.join(ROOT_DIR, "downloads")
-
-app = FastAPI(title="Deadline Rapchik API", version="3.0")
+app = FastAPI(title="DeadlineTech Hybrid API", version="1.0")
 
 @app.get("/")
 def root():
-    return {"ok": True, "msg": "Rapchik API running"}
+    return {"ok": True, "msg": "Hybrid (External API + Cookies) running"}
 
 @app.get("/song/{ytid}")
-def song(ytid: str = Path(...), video: bool = Query(False)):
-    url = url_from_id(ytid)
-    fpath = os.path.join(DOWNLOAD_DIR, f"{ytid}.{'mp4' if video else 'mp3'}")
-
-    # If already cached → serve file instantly
+def song(
+    ytid: str = Path(..., description="YouTube video ID"),
+    video: bool = Query(False, description="If true, returns mp4 720p"),
+):
+    # serve from local cache if already downloaded
+    ext = "mp4" if video else "m4a"
+    fpath = os.path.join(DOWNLOAD_DIR, f"{ytid}.{ext}")
     if os.path.exists(fpath):
         return FileResponse(fpath, filename=os.path.basename(fpath))
 
-    # Else → get direct stream URL for instant playback
+    yt_url = url_from_id(ytid)
+
+    # 1) Try your external super-fast API first
+    got = get_from_external_api(ytid, video=video)
+    if got:
+        fpath, _ = got
+        return FileResponse(fpath, filename=os.path.basename(fpath))
+
+    # 2) Fallback to yt-dlp + cookies
     try:
-        direct_url, title = get_direct_url(url, audio=not video)
+        if video:
+            fpath, _ = download_video(yt_url, ytid)
+        else:
+            fpath, _ = download_audio(yt_url, ytid)
     except Exception as e:
-        raise HTTPException(500, f"Failed to fetch: {e}")
+        raise HTTPException(status_code=500, detail=f"Download failed: {e}")
 
-    # Trigger background download to cache for future
-    trigger_background_download(url, ytid, audio=not video)
-
-    return {
-        "ok": True,
-        "cached": False,
-        "title": title,
-        "stream_url": direct_url,
-        "msg": "Serving direct stream now, caching in background",
-    }
+    return FileResponse(fpath, filename=os.path.basename(fpath))
