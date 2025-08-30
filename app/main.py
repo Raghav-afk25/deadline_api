@@ -1,47 +1,36 @@
 from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.responses import FileResponse
 import os
+from pathlib import Path
 
 from app.downloader import (
-    url_from_id,
-    get_from_external_api,
-    download_audio,
-    download_video,
+    download_audio_by_id,
+    download_video_by_id,
     DOWNLOAD_DIR,
 )
 
-app = FastAPI(title="DeadlineTech Hybrid API", version="1.0")
+app = FastAPI(title="DeadlineTech Hybrid API", version="3.0")
 
 @app.get("/")
 def root():
-    return {"ok": True, "msg": "Hybrid (External API + Cookies) running"}
+    return {"ok": True, "msg": "Running (External API first, cookies fallback)"}
 
 @app.get("/song/{ytid}")
 def song(
     ytid: str = Path(..., description="YouTube video ID"),
-    video: bool = Query(False, description="If true, returns mp4 720p"),
+    video: bool = Query(False, description="Return video instead of audio"),
 ):
-    # serve from local cache if already downloaded
-    ext = "mp4" if video else "m4a"
-    fpath = os.path.join(DOWNLOAD_DIR, f"{ytid}.{ext}")
-    if os.path.exists(fpath):
-        return FileResponse(fpath, filename=os.path.basename(fpath))
-
-    yt_url = url_from_id(ytid)
-
-    # 1) Try your external super-fast API first
-    got = get_from_external_api(ytid, video=video)
-    if got:
-        fpath, _ = got
-        return FileResponse(fpath, filename=os.path.basename(fpath))
-
-    # 2) Fallback to yt-dlp + cookies
     try:
-        if video:
-            fpath, _ = download_video(yt_url, ytid)
-        else:
-            fpath, _ = download_audio(yt_url, ytid)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Download failed: {e}")
+        ext = "mp4" if video else "m4a"
+        fpath = Path(DOWNLOAD_DIR) / f"{ytid}.{ext}"
+        if fpath.exists():
+            return FileResponse(str(fpath), filename=fpath.name)
 
-    return FileResponse(fpath, filename=os.path.basename(fpath))
+        if video:
+            fpath_str, _ = download_video_by_id(ytid)
+        else:
+            fpath_str, _ = download_audio_by_id(ytid)
+
+        return FileResponse(fpath_str, filename=os.path.basename(fpath_str))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Download error: {e}")
