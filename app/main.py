@@ -1,24 +1,43 @@
 import os
 from fastapi import FastAPI, Path, Query, HTTPException
 from fastapi.responses import FileResponse
-from app.downloader import url_from_id, download_audio, download_video
+from app.downloader import (
+    url_from_id,
+    get_direct_url,
+    trigger_background_download,
+)
 
-app = FastAPI(title="Deadline Direct API", version="1.0")
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DOWNLOAD_DIR = os.path.join(ROOT_DIR, "downloads")
+
+app = FastAPI(title="Deadline Rapchik API", version="3.0")
 
 @app.get("/")
 def root():
-    return {"ok": True, "msg": "Direct download API running"}
+    return {"ok": True, "msg": "Rapchik API running"}
 
 @app.get("/song/{ytid}")
 def song(ytid: str = Path(...), video: bool = Query(False)):
     url = url_from_id(ytid)
-    try:
-        if video:
-            path, title = download_video(url)
-        else:
-            path, title = download_audio(url)
-    except Exception as e:
-        raise HTTPException(500, f"Download failed: {e}")
+    fpath = os.path.join(DOWNLOAD_DIR, f"{ytid}.{'mp4' if video else 'mp3'}")
 
-    filename = os.path.basename(path)
-    return FileResponse(path, filename=filename, media_type="application/octet-stream")
+    # If already cached → serve file instantly
+    if os.path.exists(fpath):
+        return FileResponse(fpath, filename=os.path.basename(fpath))
+
+    # Else → get direct stream URL for instant playback
+    try:
+        direct_url, title = get_direct_url(url, audio=not video)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to fetch: {e}")
+
+    # Trigger background download to cache for future
+    trigger_background_download(url, ytid, audio=not video)
+
+    return {
+        "ok": True,
+        "cached": False,
+        "title": title,
+        "stream_url": direct_url,
+        "msg": "Serving direct stream now, caching in background",
+    }
